@@ -177,3 +177,101 @@ public class UserDetailsControllerTest {
     // Add more test methods as needed
 
 }
+
+
+
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import java.util.Optional;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+public class UserDetailsServiceImplTest {
+
+    @Mock
+    private UserDetailsRepository userDetailsRepository;
+
+    @InjectMocks
+    private UserDetailsServiceImpl userDetailsService;
+
+    private UserDetailsDTO userDetailsDTO;
+
+    @BeforeEach
+    void setUp() {
+        userDetailsDTO = new UserDetailsDTO();
+        userDetailsDTO.setUsername("testUser");
+        userDetailsDTO.setPassword("password123");
+        // Set other user details as needed
+    }
+
+    @Test
+    void testSignup_Success() {
+        UserDetails userEntity = mapToEntity(userDetailsDTO);
+        when(userDetailsRepository.save(any())).thenReturn(userEntity);
+
+        UserDetailsDTO savedUser = userDetailsService.signup(userDetailsDTO);
+
+        assertNotNull(savedUser);
+        assertEquals(userDetailsDTO.getUsername(), savedUser.getUsername());
+        // Add more assertions for other fields
+    }
+
+    @Test
+    void testSignup_Failure() {
+        when(userDetailsRepository.save(any())).thenReturn(null);
+
+        UserDetailsDTO savedUser = userDetailsService.signup(userDetailsDTO);
+
+        assertNull(savedUser);
+        // Add more assertions as needed for failure scenarios
+    }
+
+    @Test
+    void testLogin_Success() {
+        UserDetails userEntity = mapToEntity(userDetailsDTO);
+        when(userDetailsRepository.findByUsernameAndPassword(any(), any())).thenReturn(Optional.of(userEntity));
+
+        UserDetailsDTO loggedInUser = userDetailsService.login("testUser", "password123");
+
+        assertNotNull(loggedInUser);
+        assertEquals(userDetailsDTO.getUsername(), loggedInUser.getUsername());
+        // Add more assertions for other fields
+    }
+
+    @Test
+    void testLogin_Failure() {
+        when(userDetailsRepository.findByUsernameAndPassword(any(), any())).thenReturn(Optional.empty());
+
+        UserDetailsDTO loggedInUser = userDetailsService.login("testUser", "wrongPassword");
+
+        assertNull(loggedInUser);
+        // Add more assertions as needed for failure scenarios
+    }
+
+    @Test
+    void testLogout_Success() {
+        // Mocking void method
+        doNothing().when(userDetailsRepository).deleteByUsername(any());
+
+        // Call the logout method
+        userDetailsService.logout("testUser");
+
+        // Since it's void method, just verify that it was called with the correct username
+        verify(userDetailsRepository, times(1)).deleteByUsername("testUser");
+    }
+
+    private UserDetails mapToEntity(UserDetailsDTO userDetailsDTO) {
+        UserDetails userDetails = new UserDetails();
+        userDetails.setUsername(userDetailsDTO.getUsername());
+        userDetails.setPassword(userDetailsDTO.getPassword());
+        // map other fields as needed
+        return userDetails;
+    }
+}
+
