@@ -275,3 +275,87 @@ public class UserDetailsServiceImplTest {
     }
 }
 
+
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
+
+import java.util.Optional;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
+
+public class UserServiceImplTest {
+
+    @Mock
+    private UserDetailsRepository userDetailsRepository;
+
+    @InjectMocks
+    private UserServiceImpl userService;
+
+    @BeforeEach
+    public void setUp() {
+        MockitoAnnotations.initMocks(this);
+    }
+
+    @Test
+    public void testSignup() {
+        UserDetails userDetails = new UserDetails();
+        userDetails.setUserName("testUser");
+        userDetails.setPassword("testPassword");
+
+        when(userDetailsRepository.findUserByUsername(any(String.class))).thenReturn(null);
+        when(userDetailsRepository.save(any(UserDetails.class))).thenReturn(userDetails);
+
+        UserDetails savedUser = userService.signup(userDetails);
+
+        Assertions.assertNotNull(savedUser);
+        Assertions.assertEquals("testUser", savedUser.getUserName());
+    }
+
+    @Test
+    public void testLogin() {
+        String userName = "testUser";
+        String password = "testPassword";
+
+        UserDetails userDetails = new UserDetails();
+        userDetails.setUserName(userName);
+        userDetails.setPassword(password);
+
+        when(userDetailsRepository.findUserByUsername(userName)).thenReturn(Optional.of(userDetails));
+
+        String authToken = userService.login(userName, password);
+
+        Assertions.assertNotNull(authToken);
+    }
+
+    @Test
+    public void testLogout() {
+        String userName = "testUser";
+
+        when(userDetailsRepository.findUserByUsername(userName)).thenReturn(Optional.of(new UserDetails()));
+
+        userService.logout(userName);
+
+        // Add assertions if required
+    }
+}
+@Test
+public void testLogout() {
+    String userName = "testUser";
+
+    UserDetails user = new UserDetails();
+    user.setUserName(userName);
+
+    when(userDetailsRepository.findUserByUsername(userName)).thenReturn(Optional.of(user));
+
+    userService.logout(userName);
+
+    // Assert that user's authToken is null after logout
+    Assertions.assertNull(user.getAuthToken(), "User's authToken should be null after logout");
+}
+
