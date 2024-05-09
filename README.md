@@ -359,3 +359,39 @@ public void testLogout() {
     Assertions.assertNull(user.getAuthToken(), "User's authToken should be null after logout");
 }
 
+@Test
+public void testSignup_UserAlreadyExists() {
+    UserDetails existingUser = new UserDetails();
+    existingUser.setUserName("existingUser");
+
+    // Mocking the behavior when a user with the same username already exists
+    when(userDetailsRepository.findUserByUsername(existingUser.getUserName())).thenReturn(existingUser);
+
+    // Create a new user with the same username
+    UserDetails newUser = new UserDetails();
+    newUser.setUserName(existingUser.getUserName());
+
+    // Call the signup method
+    UserDetails savedUser = userService.signup(newUser);
+
+    // Assert that the signup method returns null when the user already exists
+    Assertions.assertNull(savedUser, "Signup should return null when the user already exists");
+}
+
+@Test
+public void testLogin_InvalidPassword() {
+    String userName = "testUser";
+    String password = "invalidPassword";
+
+    // Mocking the behavior when the user is found by username
+    UserDetails user = new UserDetails();
+    user.setUserName(userName);
+    user.setPassword("validPassword"); // Setting a different password
+
+    when(userDetailsRepository.findUserByUsername(userName)).thenReturn(Optional.of(user));
+
+    // Call the login method with an invalid password
+    Assertions.assertThrows(InvalidPasswordException.class, () -> {
+        userService.login(userName, password);
+    }, "Login should throw InvalidPasswordException for invalid password");
+}
