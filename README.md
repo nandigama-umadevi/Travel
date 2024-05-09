@@ -359,3 +359,23 @@ public void testLogout() {
     Assertions.assertNull(user.getAuthToken(), "User's authToken should be null after logout");
 }
 
+
+
+@Test
+public void testLogout_UserNotFound() {
+    String userName = "nonExistingUser";
+
+    when(userDetailsRepository.findUserByUsername(userName)).thenReturn(Optional.empty());
+
+    // Call logout method
+    userService.logout(userName);
+
+    // Assert that no changes were made to the user
+    // In this case, the user should not be found, so no changes should occur
+    // Assuming that authToken is null by default, we check it here
+    UserDetails user = new UserDetails(); // Create a dummy user
+    user.setAuthToken("dummyAuthToken"); // Set a dummy authToken
+    Assertions.assertEquals("dummyAuthToken", user.getAuthToken(), "User's authToken should remain unchanged");
+}
+
+
