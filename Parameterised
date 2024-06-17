@@ -1,0 +1,17 @@
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class ParameterizedTestExample {
+
+    @ParameterizedTest
+    @ValueSource(strings = { "racecar", "radar", "level" })
+    void testPalindrome(String candidate) {
+        assertTrue(isPalindrome(candidate));
+    }
+
+    boolean isPalindrome(String str) {
+        return str.equals(new StringBuilder(str).reverse().toString());
+    }
+}
