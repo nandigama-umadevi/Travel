@@ -1,0 +1,159 @@
+# mvp_agent.py - Outlook (Graph API via O365 library, works behind VPN)
+# Keeps your Outlook inbox tidy with Groq + Llama analysis
+
+import os
+import time
+import json
+import logging
+from dotenv import load_dotenv
+from O365 import Account, FileSystemTokenBackend
+import requests
+
+# Load environment variables
+load_dotenv()
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+
+# ------------------------------
+# Config
+# ------------------------------
+OUTLOOK_CLIENT_ID = os.getenv("OUTLOOK_CLIENT_ID")
+OUTLOOK_SECRET = os.getenv("OUTLOOK_SECRET", "")
+OUTLOOK_TENANT = os.getenv("OUTLOOK_TENANT", "consumers")
+OUTLOOK_SCOPES = os.getenv("OUTLOOK_SCOPES", "basic,mailbox").split(",")
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", 60))
+MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", 10))
+DRY_RUN = int(os.getenv("DRY_RUN", 1))
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+
+VIP_SENDERS_FILE = os.getenv("VIP_SENDERS_FILE", "vip_senders.json")
+AUTO_REPLY_CATEGORIES = os.getenv("AUTO_REPLY_CATEGORIES", "newsletter,notification,automated").split(",")
+
+# ------------------------------
+# Outlook Setup (O365 Device Flow)
+# ------------------------------
+credentials = (OUTLOOK_CLIENT_ID, OUTLOOK_SECRET)
+token_backend = FileSystemTokenBackend(token_path='.', token_filename='o365_token.txt')
+account = Account(credentials, token_backend=token_backend, auth_flow_type='device')
+
+if not account.is_authenticated:
+    logging.info("Authenticating with Outlook (device code flow)...")
+    account.authenticate(scopes=OUTLOOK_SCOPES)
+
+mailbox = account.mailbox()
+inbox = mailbox.inbox_folder()
+
+# ------------------------------
+# Helper Functions
+# ------------------------------
+def load_vip_senders():
+    if not os.path.exists(VIP_SENDERS_FILE):
+        return []
+    with open(VIP_SENDERS_FILE, "r") as f:
+        return json.load(f)
+
+VIP_SENDERS = load_vip_senders()
+
+def analyze_email_ai(subject, body, sender):
+    """Send email content to Groq LLM for classification"""
+    if not GROQ_API_KEY:
+        return "no_action"
+
+    content = f"Subject: {subject}\nFrom: {sender}\n\n{body}\n\n"
+    prompt = f"""Classify this email into one category:
+    - urgent
+    - newsletter
+    - notification
+    - automated
+    - vip
+    - normal
+
+    Only output one category."""
+
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You are an email classification assistant."},
+                    {"role": "user", "content": prompt + "\n\n" + content}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 10
+            }
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip().lower()
+    except Exception as e:
+        logging.error(f"Groq analysis failed: {e}")
+        return "normal"
+
+def process_email(message):
+    subject = message.subject
+    sender = message.sender.address if message.sender else "unknown"
+    body_preview = message.body_preview or ""
+
+    logging.info(f"📩 Processing email: From={sender}, Subject={subject}")
+
+    category = analyze_email_ai(subject, body_preview, sender)
+    logging.info(f"   → AI category: {category}")
+
+    if sender in VIP_SENDERS:
+        category = "vip"
+
+    if DRY_RUN:
+        logging.info("   (DRY RUN) No action taken.")
+        return
+
+    if category == "newsletter":
+        message.move(mailbox.get_folder("Newsletters"))
+    elif category == "notification":
+        message.move(mailbox.get_folder("Notifications"))
+    elif category == "automated":
+        message.move(mailbox.get_folder("Automated"))
+    elif category == "vip":
+        logging.info("   VIP email → leaving in inbox")
+    elif category == "urgent":
+        # Reply quickly
+        reply = message.reply()
+        reply.body = "Thanks, your urgent email was received. I'll get back ASAP."
+        reply.send()
+        logging.info("   Auto-replied to urgent email.")
+
+    # Mark as read after processing
+    message.is_read = True
+    message.save()
+
+# ------------------------------
+# Main Loop
+# ------------------------------
+def run_agent():
+    logging.info("Enhanced Outlook Email Agent starting...")
+    logging.info(f"DRY_RUN={DRY_RUN}, POLL_SECONDS={POLL_SECONDS}")
+
+    while True:
+        try:
+            new_messages = inbox.get_messages(limit=MAX_EMAILS_PER_CYCLE, query="isRead eq false")
+            for message in new_messages:
+                process_email(message)
+
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+
+        time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    run_agent()
