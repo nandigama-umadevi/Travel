@@ -1,0 +1,842 @@
+# mvp_agent.py - Outlook/Corporate VPN version (Graph API instead of IMAP/SMTP)
+# Keeps your Groq logic, threading helpers, state, review gates, and logs.
+
+import os
+import re
+import ssl
+import time
+import json
+import logging
+import email
+import platform
+import subprocess
+from typing import List, Tuple, Optional, Dict
+from email.header import decode_header, make_header
+from email.utils import parseaddr
+from email.message import EmailMessage
+from datetime import datetime
+import html
+import requests
+import msal
+
+# Optional .env loading
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# -----------------------
+# Configuration (yours kept; IMAP/SMTP vars are no longer used but left for compatibility)
+# -----------------------
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS", "")
+EMAIL_USER = os.getenv("EMAIL_USER", EMAIL_ADDRESS)
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+
+# Old (unused) IMAP/SMTP placeholders retained to avoid breaking asserts/imports elsewhere
+IMAP_HOST = os.getenv("IMAP_HOST", "")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_STARTTLS = os.getenv("SMTP_STARTTLS", "1") == "1"
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
+MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))
+DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
+
+REQUIRE_REVIEW_HIGH_IMPORTANCE = os.getenv("REQUIRE_REVIEW_HIGH_IMPORTANCE", "1") == "1"
+REQUIRE_REVIEW_EXTERNAL = os.getenv("REQUIRE_REVIEW_EXTERNAL", "1") == "1"
+COMPANY_DOMAIN = os.getenv("COMPANY_DOMAIN", "").lower()
+VIP_SENDERS_FILE = os.getenv("VIP_SENDERS_FILE", "vip_senders.json")
+AUTO_REPLY_CATEGORIES = os.getenv("AUTO_REPLY_CATEGORIES", "newsletter,notification,automated").split(",")
+
+# ---- Microsoft Graph (NEW) ----
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
+MS_TENANT_ID = os.getenv("MS_TENANT_ID", "")
+GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+AUTHORITY = f"https://login.microsoftonline.com/{MS_TENANT_ID}"
+
+# Optional corporate HTTP proxy (if needed)
+HTTP_PROXY = os.getenv("HTTP_PROXY")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY")
+PROXIES = {}
+if HTTP_PROXY:
+    PROXIES["http"] = HTTP_PROXY
+if HTTPS_PROXY:
+    PROXIES["https"] = HTTPS_PROXY
+
+from groq import Groq
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+
+STATE_FILE = ".processed_ids.json"
+PENDING_REVIEW_FILE = ".pending_review.json"
+
+# Assert Graph + Groq config
+assert MS_CLIENT_ID and MS_CLIENT_SECRET and MS_TENANT_ID, "Missing MS_CLIENT_ID / MS_CLIENT_SECRET / MS_TENANT_ID"
+assert EMAIL_ADDRESS, "EMAIL_ADDRESS missing (used as 'me' identity context)"
+assert GROQ_API_KEY, "Groq API key missing"
+
+# -----------------------
+# Logging and State (yours kept)
+# -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+)
+
+try:
+    PROCESSED = set(json.load(open(STATE_FILE)))
+except Exception:
+    PROCESSED = set()
+
+try:
+    PENDING_REVIEW = json.load(open(PENDING_REVIEW_FILE))
+except Exception:
+    PENDING_REVIEW = []
+
+try:
+    VIP_SENDERS = set(json.load(open(VIP_SENDERS_FILE)))
+except Exception:
+    VIP_SENDERS = set()
+    try:
+        json.dump([], open(VIP_SENDERS_FILE, 'w'))
+    except Exception:
+        pass
+
+# -----------------------
+# Email Provider Utilities (yours kept)
+# -----------------------
+NO_REPLY_PATTERNS = [
+    r"no-?reply",
+    r"donotreply",
+    r"do-?not-?reply",
+    r"noreply",
+]
+
+def save_state():
+    """Save all state to files"""
+    try:
+        json.dump(sorted(PROCESSED), open(STATE_FILE, "w"))
+        json.dump(PENDING_REVIEW, open(PENDING_REVIEW_FILE, "w"), indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save state: {e}")
+
+def decode_mime_header(value: Optional[str]) -> str:
+    """Decode MIME-encoded headers"""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+def _strip_html(html_text: str) -> str:
+    # simple HTML → text for Graph bodies
+    txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html_text or "")
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?is)</p>", "\n\n", txt)
+    txt = re.sub(r"(?s)<.*?>", "", txt)
+    txt = html.unescape(txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
+def extract_text_from_message(msg: email.message.Message) -> str:
+    """Extract text content from email.message.Message (works with our synthesized Graph messages)"""
+    def strip_html(html: str) -> str:
+        html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)
+        html = re.sub(r"(?is)<br\s*/?>", "\n", html)
+        html = re.sub(r"(?is)</p>", "\n\n", html)
+        text = re.sub(r"(?s)<.*?>", "", html)
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            if part.get_content_type() == "text/plain":
+                raw = part.get_payload(decode=True) or b""
+                return raw.decode(part.get_content_charset() or "utf-8", "replace")
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                raw = part.get_payload(decode=True) or b""
+                htmlx = raw.decode(part.get_content_charset() or "utf-8", "replace")
+                return strip_html(htmlx)
+        return ""
+    else:
+        ctype = msg.get_content_type()
+        raw = msg.get_payload(decode=True) or b""
+        text = raw.decode(msg.get_content_charset() or "utf-8", "replace")
+        return strip_html(text) if ctype == "text/html" else text
+
+def parseaddr_safe(value: str) -> Tuple[str, str]:
+    name, addr = parseaddr(value or "")
+    return name, addr
+
+def is_thread_reply(msg: email.message.Message) -> bool:
+    in_reply_to = msg.get("In-Reply-To")
+    references = msg.get("References")
+    subject = decode_mime_header(msg.get("Subject", "")).strip()
+    has_re_pattern = bool(re.match(r"^(re|fw|fwd):\s*", subject, re.IGNORECASE))
+    return bool(in_reply_to or references or has_re_pattern)
+
+def extract_original_subject(subject: str) -> str:
+    if not subject:
+        return ""
+    clean_subject = re.sub(r"^(re|fw|fwd):\s*", "", subject, flags=re.IGNORECASE)
+    clean_subject = re.sub(r"^\[.*?\]\s*", "", clean_subject)
+    return clean_subject.strip()
+
+def get_thread_id(msg: email.message.Message) -> str:
+    in_reply_to = msg.get("In-Reply-To", "").strip()
+    if in_reply_to:
+        return in_reply_to
+    references = msg.get("References", "").strip()
+    if references:
+        first_ref = references.split()[0] if references else ""
+        if first_ref:
+            return first_ref
+    subject = extract_original_subject(decode_mime_header(msg.get("Subject", "")))
+    sender = parseaddr_safe(msg.get("From", ""))[1]
+    thread_key = f"{subject.lower()}:{sender.lower()}"
+    return f"thread-{hash(thread_key)}"
+
+def threading_headers(original: email.message.Message) -> Dict[str, str]:
+    headers = {}
+    original_msg_id = original.get("Message-ID", "").strip()
+    if original_msg_id:
+        headers["In-Reply-To"] = original_msg_id
+    existing_refs = original.get("References", "").strip()
+    if existing_refs and original_msg_id:
+        headers["References"] = f"{existing_refs} {original_msg_id}"
+    elif original_msg_id:
+        headers["References"] = original_msg_id
+    elif existing_refs:
+        headers["References"] = existing_refs
+    return headers
+
+def clean_header(value: str) -> str:
+    return re.sub(r'[\r\n]', ' ', value.strip())
+
+def is_no_reply(addr: str) -> bool:
+    local = (addr or "").split("@")[0].lower()
+    return any(re.search(p, local) for p in NO_REPLY_PATTERNS)
+
+def get_email_importance(msg: email.message.Message) -> str:
+    importance = msg.get("Importance", "").lower()
+    priority = msg.get("X-Priority", "")
+    x_gmail_labels = msg.get("X-Gmail-Labels", "").lower()
+    if importance == "high" or priority == "1" or "important" in x_gmail_labels:
+        return "high"
+    elif importance == "low" or priority == "5":
+        return "low"
+    return "normal"
+
+def is_external_sender(sender_addr: str) -> bool:
+    if not COMPANY_DOMAIN or not sender_addr:
+        return False
+    return not sender_addr.lower().endswith(f"@{COMPANY_DOMAIN}")
+
+def is_vip_sender(sender_addr: str) -> bool:
+    return sender_addr.lower() in VIP_SENDERS
+
+def detect_email_category(msg: email.message.Message) -> str:
+    subject = decode_mime_header(msg.get("Subject", "")).lower()
+    sender = msg.get("From", "").lower()
+    body = extract_text_from_message(msg).lower()
+    if any(k in subject or k in sender for k in ["newsletter", "unsubscribe", "marketing", "promotion"]):
+        return "newsletter"
+    if any(k in sender for k in ["noreply", "no-reply", "donotreply", "automated", "system"]):
+        return "automated"
+    if any(k in subject for k in ["meeting", "calendar", "appointment", "schedule"]):
+        return "meeting"
+    if any(k in subject or k in body[:500] for k in ["urgent", "asap", "emergency", "critical"]):
+        return "urgent"
+    return "business"
+
+# -----------------------
+# Desktop Notification (yours kept)
+# -----------------------
+def desktop_notify(title: str, message: str):
+    plat = platform.system()
+    try:
+        if plat == 'Darwin':
+            subprocess.call(['osascript', '-e', f'display notification "{message}" with title "{title}"'])
+        elif plat == 'Windows':
+            from ctypes import windll
+            windll.user32.MessageBoxW(0, message, title, 0x00001000)
+        elif plat == 'Linux':
+            subprocess.call(['notify-send', title, message])
+        else:
+            logging.warning("Desktop notifications not supported on this platform")
+    except Exception as e:
+        logging.error(f"Failed to send desktop notification: {e}")
+
+# -----------------------
+# Graph Auth + HTTP helpers (NEW)
+# -----------------------
+_ms_app = msal.ConfidentialClientApplication(
+    MS_CLIENT_ID, authority=AUTHORITY, client_credential=MS_CLIENT_SECRET
+)
+
+def _graph_token() -> str:
+    result = _ms_app.acquire_token_silent(GRAPH_SCOPE, account=None)
+    if not result:
+        result = _ms_app.acquire_token_for_client(scopes=GRAPH_SCOPE)
+    if "access_token" not in result:
+        raise RuntimeError(f"Graph auth failed: {result}")
+    return result["access_token"]
+
+def _gget(path: str, params: Dict = None):
+    tok = _graph_token()
+    headers = {"Authorization": f"Bearer {tok}"}
+    resp = requests.get(f"{GRAPH_BASE}{path}", headers=headers, params=params or {}, proxies=PROXIES, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+def _gpost(path: str, payload: Dict):
+    tok = _graph_token()
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    resp = requests.post(f"{GRAPH_BASE}{path}", headers=headers, json=payload, proxies=PROXIES, timeout=60)
+    resp.raise_for_status()
+    return resp.json() if resp.text.strip() else {}
+
+# -----------------------
+# Graph → EmailMessage bridge (NEW)
+# -----------------------
+# We keep a side index to map Message-ID ⇄ Graph message JSON for threading/replies
+GRAPH_INDEX: Dict[str, Dict] = {}  # key: internetMessageId, value: full Graph message JSON
+
+def _graph_json_to_email_message(g: Dict) -> EmailMessage:
+    """
+    Synthesize an email.message.EmailMessage from Graph JSON so the rest of your logic works unchanged.
+    """
+    msg = EmailMessage()
+    from_addr = (g.get("from") or {}).get("emailAddress") or {}
+    sender_addr = from_addr.get("address", "")
+    sender_name = from_addr.get("name", "")
+    to_list = g.get("toRecipients") or []
+    to_primary = (to_list[0]["emailAddress"]["address"] if to_list else EMAIL_ADDRESS)
+
+    msg["From"] = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
+    msg["To"] = to_primary
+    msg["Subject"] = g.get("subject", "") or ""
+    # Use RFC 2822 compatible date if present
+    rdt = g.get("receivedDateTime")
+    if rdt:
+        msg["Date"] = rdt
+    # Map threading ids where possible
+    internet_id = g.get("internetMessageId") or ""
+    if internet_id:
+        msg["Message-ID"] = internet_id
+
+    # Graph v1.0 doesn't expose References/In-Reply-To directly; leave empty (your fallback logic handles it)
+    body = g.get("body") or {}
+    ctype = (body.get("contentType") or "Text").lower()
+    content = body.get("content") or ""
+    if ctype == "html":
+        # store as plain-text for your extract_text_* pipeline
+        msg.set_content(_strip_html(content))
+    else:
+        msg.set_content(content)
+
+    return msg
+
+# -----------------------
+# Thread context via Graph (replacement of IMAP lookups)
+# -----------------------
+def fetch_thread_context(msg: email.message.Message, limit: int = 5) -> List[Dict]:
+    """
+    Graph-based thread fetch using conversationId when available; falls back to subject search.
+    """
+    try:
+        internet_id = (msg.get("Message-ID") or "").strip()
+        g = GRAPH_INDEX.get(internet_id, {})
+        thread_context = []
+
+        # Prefer conversationId (native Outlook threading)
+        conv_id = g.get("conversationId")
+        if conv_id:
+            data = _gget(f"/me/messages", params={
+                "$filter": f"conversationId eq '{conv_id}'",
+                "$orderby": "receivedDateTime asc",
+                "$top": str(limit)
+            })
+            for it in data.get("value", []):
+                body_text = _strip_html(((it.get("body") or {}).get("content") or ""))[:1000]
+                frm = ((it.get("from") or {}).get("emailAddress") or {})
+                thread_context.append({
+                    "date": it.get("receivedDateTime", ""),
+                    "from": f"{frm.get('name','')} <{frm.get('address','')}>".strip(),
+                    "subject": it.get("subject", ""),
+                    "body": body_text,
+                    "message_id": it.get("internetMessageId","")
+                })
+
+        # Fallback: subject-based search
+        if not thread_context:
+            subj = decode_mime_header(msg.get("Subject", ""))
+            if subj:
+                data = _gget(f"/me/messages", params={
+                    "$search": f"\"{subj}\"",
+                    "$orderby": "receivedDateTime asc",
+                    "$top": str(limit)
+                })
+                for it in data.get("value", []):
+                    body_text = _strip_html(((it.get("body") or {}).get("content") or ""))[:1000]
+                    frm = ((it.get("from") or {}).get("emailAddress") or {})
+                    thread_context.append({
+                        "date": it.get("receivedDateTime", ""),
+                        "from": f"{frm.get('name','')} <{frm.get('address','')}>".strip(),
+                        "subject": it.get("subject", ""),
+                        "body": body_text,
+                        "message_id": it.get("internetMessageId","")
+                    })
+
+        thread_context.sort(key=lambda x: x.get('date', ''))
+        return thread_context[-limit:]
+    except Exception as e:
+        logging.error(f"Thread context fetch failed (Graph): {e}")
+        return []
+
+# -----------------------
+# Groq logic (yours kept verbatim)
+# -----------------------
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+def summarize_thread(thread_context: List[Dict]) -> str:
+    if not thread_context:
+        return ""
+    thread_text = ""
+    for ctx in thread_context:
+        thread_text += f"[{ctx['date']}] From: {ctx['from']}\nSubject: {ctx['subject']}\n{ctx['body']}\n\n"
+    if len(thread_text) > 4000:
+        thread_text = thread_text[-4000:]
+    summary_prompt = (
+        "You are a thread summary assistant. Summarize this email conversation history in 2-4 sentences. "
+        "Focus on: 1) What the conversation is about, 2) Key decisions or requests made, 3) Current status/next steps. "
+        "Be concise but informative. Output only the summary text."
+    )
+    try:
+        resp = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": summary_prompt},
+                {"role": "user", "content": thread_text},
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        summary = resp.choices[0].message.content.strip()
+        logging.info(f"Generated thread summary: {summary[:100]}...")
+        return summary
+    except Exception as e:
+        logging.error(f"Thread summary failed: {e}")
+        return f"Thread conversation with {len(thread_context)} previous messages. Unable to generate detailed summary."
+
+def build_thread_aware_prompt(msg: email.message.Message, thread_context: List[Dict]) -> str:
+    subject = decode_mime_header(msg.get("Subject", "")) or "(no subject)"
+    sender = decode_mime_header(msg.get("From", "")) or "(unknown sender)"
+    sender_addr = parseaddr_safe(msg.get("From", ""))[1]
+
+    importance = get_email_importance(msg)
+    is_external = is_external_sender(sender_addr)
+    is_vip = is_vip_sender(sender_addr)
+    category = detect_email_category(msg)
+    is_reply = is_thread_reply(msg)
+
+    current_body = extract_text_from_message(msg)
+
+    thread_summary = summarize_thread(thread_context)
+
+    context_section = ""
+    if thread_context:
+        context_section = f"\n=== THREAD HISTORY SUMMARY ===\n{thread_summary}\n"
+        context_section += "\n=== RECENT THREAD MESSAGES ===\n"
+        for i, ctx in enumerate(thread_context[-3:], 1):
+            context_section += f"\n{i}. [{ctx['date']}] From: {ctx['from']}\n"
+            context_section += f"   Subject: {ctx['subject']}\n"
+            context_section += f"   Body: {ctx['body'][:300]}...\n"
+        context_section += "\n=== END THREAD HISTORY ===\n"
+
+    metadata = f"""Email Analysis Request:
+
+CURRENT EMAIL:
+- Subject: {subject}
+- From: {sender}
+- Importance: {importance}
+- External sender: {is_external}
+- VIP sender: {is_vip}
+- Category: {category}
+- Is thread reply: {is_reply}
+- Company domain: {COMPANY_DOMAIN or 'not set'}
+
+{context_section}
+
+CURRENT EMAIL BODY:
+\"\"\"{current_body[:4000]}\"\"\"
+
+
+INSTRUCTIONS:
+This email {'is part of an ongoing thread' if is_reply else 'appears to be a new conversation'}. 
+{'Consider the full thread context and summary when generating your response.' if thread_context else 'Generate an appropriate response based on this email.'}
+
+Provide a JSON response with thread-aware analysis and reply generation.
+"""
+    return metadata
+
+def groq_chat_complete_with_thread(user_prompt: str, is_thread_reply: bool = False) -> dict:
+    thread_context = "thread continuation" if is_thread_reply else "new conversation"
+    system_prompt = f"""You are an advanced email assistant specializing in {thread_context}. 
+    
+When processing thread replies:
+- Consider the full conversation history
+- Maintain context and reference previous points
+- Provide continuity in communication tone
+- Address specific questions or requests from the thread
+- Avoid repeating information already covered
+
+When processing new conversations:
+- Focus on the current email content
+- Provide comprehensive initial responses
+- Set appropriate tone for the relationship
+
+Return ONLY a strict JSON object with keys:
+{{
+  "reply_needed": true|false,
+  "urgency_score": 0.0-1.0,
+  "category": "urgent|meeting|business|customer|internal|automated|newsletter",
+  "sentiment": "positive|negative|neutral", 
+  "requires_action": true|false,
+  "summary": "string",
+  "key_points": ["point1", "point2"],
+  "proposed_subject": "string",
+  "proposed_body": "string",
+  "confidence": 0.0-1.0,
+  "thread_context_used": true|false,
+  "is_thread_continuation": {str(is_thread_reply).lower()}
+}}
+
+Be professional, contextually aware, and ensure replies maintain thread continuity.
+"""
+    try:
+        resp = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=1200,
+        )
+        content = resp.choices[0].message.content
+        try:
+            return json.loads(content)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", content)
+            if not m:
+                raise ValueError("Model did not return JSON.")
+            return json.loads(m.group(0))
+    except Exception as e:
+        logging.error(f"Groq API error: {e}")
+        return {
+            "reply_needed": False,
+            "urgency_score": 0.5,
+            "category": "business",
+            "sentiment": "neutral",
+            "requires_action": False,
+            "summary": "AI analysis failed",
+            "key_points": [],
+            "proposed_subject": "",
+            "proposed_body": "",
+            "confidence": 0.0,
+            "thread_context_used": False,
+            "is_thread_continuation": is_thread_reply
+        }
+
+# -----------------------
+# Send mail via Graph (replaces SMTP) — we keep the same function name to avoid touching your flow
+# -----------------------
+def smtp_send(to_addr: str, subject: str, body: str, headers: dict = None, original_graph_msg_id: Optional[str] = None):
+    """
+    Send using Microsoft Graph. If we know the Graph message 'id' of the original,
+    we try a proper 'reply' to preserve threading. Otherwise we send a new message with 'Re:' subject.
+    """
+    if DRY_RUN:
+        logging.info("DRY_RUN=1 (not sending). Set DRY_RUN=0 to send.")
+        return
+
+    try:
+        if original_graph_msg_id:
+            # Use the reply endpoint to preserve threading
+            payload = {
+                "comment": "",
+                "message": {
+                    "body": {
+                        "contentType": "Text",
+                        "content": body
+                    }
+                }
+            }
+            _gpost(f"/me/messages/{original_graph_msg_id}/reply", payload)
+            logging.info("Graph reply sent via /reply to message id=%s", original_graph_msg_id)
+            return
+
+        # Fallback: sendMail
+        message = {
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": to_addr}}],
+            }
+        }
+        _gpost("/me/sendMail", message)
+        logging.info("Graph sendMail sent to %s", to_addr)
+    except Exception as e:
+        logging.error(f"Graph send failed: {e}")
+        raise
+
+# -----------------------
+# Message Processing (yours kept with minimal changes)
+# -----------------------
+def requires_manual_review(msg: email.message.Message, ai_decision: dict) -> Tuple[bool, str]:
+    reasons = []
+    if REQUIRE_REVIEW_HIGH_IMPORTANCE and get_email_importance(msg) == "high":
+        reasons.append("High importance email")
+    from_addr = parseaddr_safe(msg.get("From", ""))[1]
+    if REQUIRE_REVIEW_EXTERNAL and is_external_sender(from_addr):
+        reasons.append("External sender")
+    if is_vip_sender(from_addr):
+        reasons.append("VIP sender")
+    if ai_decision.get("urgency_score", 0) > 0.8:
+        reasons.append("High urgency detected")
+    if ai_decision.get("confidence", 1.0) < 0.7:
+        reasons.append("Low AI confidence")
+    if ai_decision.get("is_thread_continuation") and ai_decision.get("confidence", 1.0) < 0.8:
+        reasons.append("Complex thread continuation")
+    return len(reasons) > 0, "; ".join(reasons)
+
+def add_to_pending_review(msg: email.message.Message, decision: dict, reason: str, thread_summary: str = "", thread_context: List[Dict] = None):
+    original_headers = {}
+    for header_name in ['Message-ID', 'In-Reply-To', 'References', 'Date']:
+        header_value = msg.get(header_name)
+        if header_value:
+            original_headers[header_name] = header_value
+
+    pending_item = {
+        "timestamp": datetime.now().isoformat(),
+        "message_id": msg.get("Message-ID"),
+        "from": msg.get("From"),
+        "subject": decode_mime_header(msg.get("Subject", "")),
+        "importance": get_email_importance(msg),
+        "category": decision.get("category", "unknown"),
+        "reason": reason,
+        "ai_decision": decision,
+        "body_preview": extract_text_from_message(msg)[:200] + "...",
+        "is_thread_reply": is_thread_reply(msg),
+        "thread_context_used": decision.get("thread_context_used", False),
+        "thread_summary": thread_summary,
+        "original_headers": original_headers,
+        "thread_context": thread_context or []
+    }
+    PENDING_REVIEW.append(pending_item)
+    logging.info("Added to review queue: %s - %s", pending_item["from"], reason)
+    desktop_notify("Email Pending Review", f"From: {pending_item['from']}\nSubject: {pending_item['subject']}\nReason: {reason}")
+
+def process_one_message(msg: email.message.Message):
+    subject = decode_mime_header(msg.get("Subject", ""))
+    from_name, from_addr = parseaddr_safe(msg.get("From", ""))
+    reply_to_name, reply_to_addr = parseaddr_safe(msg.get("Reply-To") or msg.get("From", ""))
+
+    importance = get_email_importance(msg)
+    category = detect_email_category(msg)
+    is_reply = is_thread_reply(msg)
+
+    if not from_addr:
+        logging.info("Skip: no From address")
+        return
+
+    if is_no_reply(from_addr) or (reply_to_addr and is_no_reply(reply_to_addr)):
+        logging.info("Skip no-reply sender: %s", from_addr)
+        return
+
+    body = extract_text_from_message(msg).strip()
+    if not body:
+        logging.info("Skip: empty body")
+        return
+
+    logging.info("Processing | from=%s | subject=%s | importance=%s | category=%s | thread_reply=%s",
+                 from_addr, subject, importance, category, is_reply)
+
+    # Graph-based thread context
+    thread_context = []
+    thread_summary = ""
+    if is_reply:
+        thread_context = fetch_thread_context(msg, limit=5)
+        thread_summary = summarize_thread(thread_context)
+        logging.info("Thread context: %d previous messages found", len(thread_context))
+        if thread_summary:
+            logging.info("Thread summary: %s", thread_summary[:100])
+
+    # AI analysis with thread context
+    try:
+        prompt = build_thread_aware_prompt(msg, thread_context)
+        decision = groq_chat_complete_with_thread(prompt, is_reply)
+        if decision.get("thread_context_used"):
+            logging.info("AI used thread context for analysis")
+    except Exception as e:
+        logging.error("AI processing error: %s", e)
+        return
+
+    reply_needed = bool(decision.get("reply_needed", False))
+    confidence = decision.get("confidence", 0.5)
+
+    logging.info("AI analysis | reply_needed=%s | confidence=%.2f | thread_continuation=%s",
+                 reply_needed, confidence, decision.get("is_thread_continuation"))
+
+    if not reply_needed:
+        logging.info("Decision: no reply needed")
+        return
+
+    needs_review, review_reason = requires_manual_review(msg, decision)
+    if needs_review:
+        add_to_pending_review(msg, decision, review_reason, thread_summary, thread_context)
+        return
+
+    proposed_subject = decision.get("proposed_subject", "").strip()
+    proposed_body = decision.get("proposed_body", "").strip()
+    if not proposed_body:
+        logging.info("Skip: AI did not generate reply body")
+        return
+
+    if is_reply:
+        original_subject = extract_original_subject(subject)
+        final_subject = f"Re: {original_subject}" if original_subject else f"Re: {subject}"
+    else:
+        final_subject = proposed_subject if proposed_subject else f"Re: {subject}"
+
+    to_addr = reply_to_addr or from_addr
+    if to_addr.lower() == EMAIL_ADDRESS.lower():
+        logging.info("Skip: would reply to self")
+        return
+
+    headers = threading_headers(msg)
+    cleaned_headers = {k: clean_header(v) for k, v in headers.items()}
+
+    # Try to get Graph original message id so we can use /reply
+    original_graph_msg_id = None
+    internet_id = (msg.get("Message-ID") or "").strip()
+    gjson = GRAPH_INDEX.get(internet_id)
+    if gjson:
+        original_graph_msg_id = gjson.get("id")
+
+    logging.info("Thread-aware reply → %s | %s | confidence=%.2f | headers=%s",
+                 to_addr, final_subject, confidence, list(headers.keys()))
+    logging.info("Reply body preview: %s", (proposed_body[:200] + "..."))
+
+    try:
+        smtp_send(to_addr, final_subject, proposed_body, cleaned_headers, original_graph_msg_id=original_graph_msg_id)
+        logging.info("Sent thread-aware reply to %s", to_addr)
+    except Exception as e:
+        logging.error("Send failed: %s", e)
+
+# -----------------------
+# Graph: fetch unread (replaces IMAP)
+# -----------------------
+def graph_fetch_unseen(limit=10) -> List[email.message.Message]:
+    """
+    Fetch unread inbox messages via Graph and convert to EmailMessage list.
+    Side effect: populate GRAPH_INDEX for threading/replies.
+    """
+    try:
+        params = {
+            "$filter": "isRead eq false",
+            "$orderby": "receivedDateTime desc",
+            "$top": str(limit),
+            "$select": "id,subject,from,receivedDateTime,internetMessageId,conversationId,bodyPreview,body,replyTo,toRecipients"
+        }
+        data = _gget("/me/mailFolders/Inbox/messages", params=params)
+        items = data.get("value", [])
+        messages: List[email.message.Message] = []
+
+        for g in items:
+            # build mapping for later reply/thread context
+            internet_id = g.get("internetMessageId")
+            if internet_id:
+                GRAPH_INDEX[internet_id] = g
+
+            # synthesize EmailMessage so your existing pipeline works unchanged
+            em = _graph_json_to_email_message(g)
+            messages.append(em)
+
+        return messages
+    except Exception as e:
+        logging.error(f"Graph fetch error: {e}")
+        return []
+
+# -----------------------
+# Run cycle (uses Graph fetch now)
+# -----------------------
+def run_cycle():
+    try:
+        msgs = graph_fetch_unseen(limit=MAX_EMAILS_PER_CYCLE)
+        if not msgs:
+            logging.info("No unread emails.")
+            return
+
+        logging.info("Processing %d unread emails", len(msgs))
+        for m in msgs:
+            msg_id = (m.get("Message-ID") or "").strip()
+            if msg_id and msg_id in PROCESSED:
+                logging.info("Skip (already processed): %s", msg_id)
+                continue
+            process_one_message(m)
+            if msg_id:
+                PROCESSED.add(msg_id)
+        save_state()
+
+        if PENDING_REVIEW:
+            logging.info("=== %d emails pending manual review ===", len(PENDING_REVIEW))
+
+    except Exception as e:
+        logging.error("Cycle error: %s", e)
+
+def show_pending_review():
+    if not PENDING_REVIEW:
+        print("No emails pending review.")
+        return
+    print(f"\n=== {len(PENDING_REVIEW)} Emails Pending Review ===")
+    for i, item in enumerate(PENDING_REVIEW, 1):
+        print(f"\n{i}. From: {item['from']}")
+        print(f"   Subject: {item['subject']}")
+        print(f"   Importance: {item['importance']}")
+        print(f"   Thread Reply: {item.get('is_thread_reply', False)}")
+        print(f"   Reason: {item['reason']}")
+        print(f"   Preview: {item['body_preview']}")
+        if item.get("thread_summary"):
+            print(f"   Thread Summary: {item['thread_summary'][:200]}...")
+
+# -----------------------
+# Main Execution
+# -----------------------
+if __name__ == "__main__":
+    logging.info("Enhanced Email Agent (Graph) starting (DRY_RUN=%s, POLL_SECONDS=%s)", int(DRY_RUN), POLL_SECONDS)
+    logging.info("Provider: Microsoft Graph | Company: %s", COMPANY_DOMAIN)
+    logging.info("Review settings: HIGH_IMPORTANCE=%s, EXTERNAL=%s",
+                 REQUIRE_REVIEW_HIGH_IMPORTANCE, REQUIRE_REVIEW_EXTERNAL)
+    logging.info("Thread handling: ENABLED with Graph conversation fetch")
+
+    if PENDING_REVIEW:
+        show_pending_review()
+
+    try:
+        while True:
+            run_cycle()
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        logging.info("Agent stopped by user")
+        save_state()
+    except Exception as e:
+        logging.error("Agent crashed: %s", e)
+        save_state()
