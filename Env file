@@ -1,0 +1,25 @@
+# ---- Microsoft Graph (Outlook) ----
+MS_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+MS_CLIENT_SECRET=your_generated_client_secret
+MS_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+# The mailbox address (your Outlook email)
+EMAIL_ADDRESS=you@yourcompany.com
+
+# ---- Groq API ----
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.1-8b-instant   # or another model if you want
+
+# ---- Runtime Settings ----
+POLL_SECONDS=60
+MAX_EMAILS_PER_CYCLE=10
+DRY_RUN=1   # set to 0 if you actually want to send replies
+
+# Review & Classification
+REQUIRE_REVIEW_HIGH_IMPORTANCE=1
+REQUIRE_REVIEW_EXTERNAL=1
+COMPANY_DOMAIN=yourcompany.com
+
+# Optional corporate proxy (only if needed)
+HTTP_PROXY=http://proxy.mycompany.com:8080
+HTTPS_PROXY=http://proxy.mycompany.com:8080
